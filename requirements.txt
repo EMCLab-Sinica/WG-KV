@@ -1,0 +1,7 @@
+torch==2.8.0
+transformers==4.53.3
+accelerate
+datasets==3.6.0
+matplotlib
+wandb
+einops

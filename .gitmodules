@@ -1,0 +1,10 @@
+[submodule "scripts/third_party/duo_attn"]
+	path = scripts/third_party/duo_attn
+	url = https://github.com/lashhw/duo_attn.git
+	branch = dev
+[submodule "scripts/third_party/LongProc"]
+	path = scripts/third_party/LongProc
+	url = https://github.com/princeton-pli/LongProc.git
+[submodule "scripts/third_party/lm-evaluation-harness"]
+	path = scripts/third_party/lm-evaluation-harness
+	url = https://github.com/lashhw/lm-evaluation-harness

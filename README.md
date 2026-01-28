@@ -11,6 +11,14 @@ We propose **Write-Gated KV (WG-KV)** to introduce a missing primitive: **KV Adm
 
 <p align="center" width="100%"><img src="assets/fig5.png" width="400"></p>
 
+## ⚙️ System Architecture
+
+Implementing WG-KV results in **Ragged KV States**, where different attention heads possess significantly different cache lengths. Standard contiguous memory allocation would lead to severe fragmentation. To solve this, we introduce **Dual-Cache Paged Memory Management**:
+
+<p align="center" width="100%"><img src="assets/fig6.png" width="800"></p>
+
+This design ensures that WG-KV remains compatible with optimized **PagedAttention** kernels, translating theoretical sparsity into actual wall-clock speedups.
+
 ## 🛠️ Installation
 
 ### 1. Clone the Repository

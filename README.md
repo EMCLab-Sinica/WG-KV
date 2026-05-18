@@ -75,9 +75,6 @@ We provide pre-trained weights for the **Write-Gate MLP**. The checkpoints follo
 You can download them directly from [🤗 our Hugging Face Repository](https://huggingface.co/WG-KV/checkpoints).
 
 ```bash
-# Install the Hugging Face CLI
-uv pip install huggingface_hub
-
 # Download Llama-3.1-8B-Instruct checkpoints
 hf download WG-KV/checkpoints --include "llama-3.1-8b-instruct-*.pt" --local-dir weights
 
@@ -92,12 +89,12 @@ hf download WG-KV/checkpoints --include "qwen3-4b-thinking-2507-*.pt" --local-di
 
 ### Training
 
-To train the gate (e.g., for Llama-3.1-8B) with a specific λ (e.g., 0.04):
+To train the gate (e.g., for Llama-3.1-8B) with a specific λ (e.g., 0.16):
 
 ```bash
 python scripts/train.py \
   --model_name meta-llama/Llama-3.1-8B-Instruct \
-  --lambda_reg 0.04
+  --lambda_reg 0.16
 ```
 
 The trained checkpoints will be saved in the `outputs/` directory.
@@ -111,7 +108,7 @@ To run inference using the trained gate, specify the checkpoint path using `--fi
 ```bash
 python scripts/inference.py \
   --model_name meta-llama/Llama-3.1-8B-Instruct \
-  --filtering_path weights/llama-3.1-8b-instruct-0.04.pt
+  --filtering_path weights/llama-3.1-8b-instruct-0.16.pt
 ```
 
 *See `scripts/inference.py` for additional arguments.*
@@ -173,8 +170,8 @@ uv pip install flash-attn --no-build-isolation
 env -C scripts/third_party/HELMET bash scripts/download_data.sh
 
 # Link checkpoints directory
+ln -s ../utils/gather_adaea_stats/patterns weights/adaea
 ln -s ../../../weights scripts/third_party/HELMET/weights
-ln -s ../../../utils/gather_adaea_stats/patterns scripts/third_party/HELMET/weights/adaea
 
 # Evaluate Baselines (Full Attention, Local Attention, DuoAttention, AdaEA++)
 env -C scripts/third_party/HELMET bash run_vanilla_all.sh

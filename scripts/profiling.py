@@ -1,6 +1,7 @@
 import argparse
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, DynamicCache
+from datasets import load_dataset
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from dataclasses import dataclass
 
 @dataclass
@@ -25,9 +26,9 @@ def parse_args():
         default=None,
     )
     parser.add_argument(
-        "--g_rms",
+        "--avg_tokens_per_head",
         type=int,
-        default=0,
+        default=None,
     )
     parser.add_argument(
         "--max_tokens_per_head",
@@ -37,12 +38,22 @@ def parse_args():
     parser.add_argument(
         "--random_sparsity",
         type=float,
-        default=0.0,
+        default=None,
+    )
+    parser.add_argument(
+        "--filtering_path",
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--prompt_length",
         type=int,
-        default=32768,
+        default=32000,
+    )
+    parser.add_argument(
+        "--use_pg19",
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
         "--num_warmup",
@@ -57,7 +68,7 @@ def parse_args():
     parser.add_argument(
         "--num_decode_steps",
         type=int,
-        default=100,
+        default=300,
     )
     parser.add_argument(
         "--profile_attn_mlp",
@@ -67,9 +78,42 @@ def parse_args():
     parser.add_argument(
         "--attn_granularity",
         choices=["rms_linear_attn", "linear_attn", "attn", "wrapper", "kernel", "predictor"],
-        default="wrapper",
+        default="kernel",
     )
     return parser.parse_args()
+
+
+def build_pg19_inputs(tokenizer, prompt_length, device):
+    dataset = load_dataset("emozilla/pg19", split="train")
+
+    token_chunks = []
+    total_tokens = 0
+    sample_idx = 0
+
+    while total_tokens < prompt_length:
+        if sample_idx >= len(dataset):
+            raise ValueError("PG19 dataset exhausted before reaching prompt_length")
+
+        remaining_tokens = prompt_length - total_tokens
+        text = dataset[sample_idx]["text"]
+        input_ids = tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=remaining_tokens,
+            return_attention_mask=False,
+        )["input_ids"]
+
+        token_chunks.append(torch.tensor(input_ids, dtype=torch.long))
+        total_tokens += len(input_ids)
+        sample_idx += 1
+
+    input_ids = torch.cat(token_chunks)[:prompt_length].unsqueeze(0).to(device)
+    attention_mask = torch.ones((1, prompt_length), dtype=torch.long, device=device)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
 
 
 def measure_time(start_event, end_event, func, *args, **kwargs):
@@ -158,11 +202,16 @@ def main():
     if args.g_expand is not None:
         model_config.g_expand = args.g_expand
 
-    model_config.g_rms = args.g_rms
-    model_config.max_total_tokens = args.max_tokens_per_head * model_config.num_hidden_layers * model_config.num_key_value_heads
+    if args.avg_tokens_per_head is not None:
+        model_config.max_total_tokens = args.avg_tokens_per_head * model_config.num_hidden_layers * model_config.num_key_value_heads
+    else:
+        model_config.max_total_tokens = args.max_tokens_per_head * model_config.num_hidden_layers * model_config.num_key_value_heads
+
     model_config.max_tokens_per_head = args.max_tokens_per_head
     model_config.random_sparsity = args.random_sparsity
     model_config.g_fast_path = True
+    model_config.g_defer = True
+    model_config.use_triton_kernel = True
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -170,12 +219,22 @@ def main():
         torch_dtype="auto",
         device_map="auto"
     )
+
+    if args.filtering_path is not None:
+        # this will load weights in bf16
+        state_dict = torch.load(args.filtering_path)
+        model.load_state_dict(state_dict, strict=False)
+
     model.gating_mode = 3
 
-    inputs = {
-        "input_ids": torch.zeros((1, args.prompt_length), dtype=torch.long, device=model.device),
-        "attention_mask": torch.ones((1, args.prompt_length), dtype=torch.long, device=model.device),
-    }
+    if args.use_pg19:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        inputs = build_pg19_inputs(tokenizer, args.prompt_length, model.device)
+    else:
+        inputs = {
+            "input_ids": torch.zeros((1, args.prompt_length), dtype=torch.long, device=model.device),
+            "attention_mask": torch.ones((1, args.prompt_length), dtype=torch.long, device=model.device),
+        }
 
     timing_phase = TimingPhase()
 
@@ -253,10 +312,10 @@ def main():
                     layer.self_attn.prefill_kernel,
                     get_attn_tracker
                 )
-                layer.self_attn.decode_kernel = get_func_with_timing(
+                layer.self_attn.decode_kernel_executor = get_func_with_timing(
                     start_event_layer,
                     end_event_layer,
-                    layer.self_attn.decode_kernel,
+                    layer.self_attn.decode_kernel_executor,
                     get_attn_tracker
                 )
             else:  # predictor

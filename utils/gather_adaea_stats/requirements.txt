@@ -1,0 +1,7 @@
+datasets==3.6.0
+torch==2.8.0
+transformers==4.56.0
+kvpress
+matplotlib
+einops
+wandb

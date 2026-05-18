@@ -16,6 +16,8 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import numpy as np
+import math
 
 from transformers.utils import logging
 
@@ -31,6 +33,8 @@ except:
     pass
 
 try:
+    import triton
+    import triton.language as tl
     from vllm.vllm_flash_attn import sparse_attn_func, flash_attn_with_kvcache
 except:
     pass
@@ -797,7 +801,6 @@ def flash_attn_with_kvcache_wrapper(
         block_table=block_table,
         softmax_scale=softmax_scale,
         causal=True,
-        num_splits=2,
     )
 
     return rearrange(
@@ -808,10 +811,380 @@ def flash_attn_with_kvcache_wrapper(
     )
 
 
+def flash_attn_with_kvcache_wrapper_handle(*args, **kwargs):
+    return lambda: flash_attn_with_kvcache_wrapper(*args, **kwargs)
+
+
+def _validate_decode_inputs(q, cache_seqlens, block_table):
+    assert q.shape[0] == 1
+    assert cache_seqlens.shape[0] == 1
+    assert block_table.shape[0] == 1
+
+    _, q_len, num_query_heads, head_size = q.shape
+    _, num_kv_heads = cache_seqlens.shape
+
+    assert q_len == 1
+    assert num_query_heads % num_kv_heads == 0
+
+    num_kv_groups = num_query_heads // num_kv_heads
+
+    return num_query_heads, num_kv_heads, num_kv_groups, head_size
+
+
+@triton.jit
+def _paged_attention_decode_split_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    cache_seqlens_ptr,
+    block_table_ptr,
+    chunk_kv_head_ptr,
+    chunk_start_block_ptr,
+    chunk_num_blocks_ptr,
+    softmax_scale,
+    partial_m_ptr,
+    partial_l_ptr,
+    partial_acc_ptr,
+    num_kv_groups,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_kt,
+    stride_kd,
+    stride_vb,
+    stride_vt,
+    stride_vd,
+    stride_sh,
+    stride_bh,
+    stride_bb,
+    stride_pmc,
+    stride_pmg,
+    stride_plc,
+    stride_plg,
+    stride_pac,
+    stride_pag,
+    stride_pad,
+    BLOCK_N: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    chunk_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+
+    tl.static_assert(BLOCK_N % BLOCK_T == 0, "BLOCK_N must be divisible by BLOCK_T.")
+    BLOCKS_PER_STEP: tl.constexpr = BLOCK_N // BLOCK_T
+
+    block_offs = tl.arange(0, BLOCKS_PER_STEP)
+    t_offs = tl.arange(0, BLOCK_T)
+    d_offs = tl.arange(0, BLOCK_D)
+
+    kv_head_idx = tl.load(chunk_kv_head_ptr + chunk_idx)
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
+
+    seqlen = tl.load(cache_seqlens_ptr + kv_head_idx * stride_sh)
+    start_block = tl.load(chunk_start_block_ptr + chunk_idx)
+    num_blocks_in_chunk = tl.load(chunk_num_blocks_ptr + chunk_idx)
+
+    q_ptrs = q_ptr + q_head_idx * stride_qh + d_offs * stride_qd
+    q_bf16 = tl.load(q_ptrs)
+
+    block_table_head_ptr = block_table_ptr + kv_head_idx * stride_bh
+    k_block_offsets = t_offs[None, :, None] * stride_kt + d_offs[None, None, :] * stride_kd
+    v_block_offsets = t_offs[None, :, None] * stride_vt + d_offs[None, None, :] * stride_vd
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for chunk_block_offset in tl.range(0, num_blocks_in_chunk, BLOCKS_PER_STEP):
+        live_block_offs = chunk_block_offset + block_offs
+        logical_block_idxs = start_block + live_block_offs
+        block_mask = live_block_offs < num_blocks_in_chunk
+
+        physical_block_ptrs = block_table_head_ptr + logical_block_idxs * stride_bb
+        physical_block_idxs = tl.load(physical_block_ptrs, mask=block_mask, other=0).to(tl.int64)
+
+        token_offsets = logical_block_idxs[:, None] * BLOCK_T + t_offs[None, :]
+        t_mask = block_mask[:, None] & (token_offsets < seqlen)
+        kv_mask = t_mask[:, :, None]
+
+        k_ptrs = k_cache_ptr + physical_block_idxs[:, None, None] * stride_kb + k_block_offsets
+        k_bf16 = tl.load(k_ptrs, mask=kv_mask, other=0.0)
+        k_bf16 = tl.reshape(k_bf16, BLOCK_N, BLOCK_D)
+
+        t_mask = tl.reshape(t_mask, BLOCK_N)
+        logits = tl.sum(q_bf16[None, :] * k_bf16, axis=1, dtype=tl.float32) * softmax_scale
+        logits = tl.where(t_mask, logits, -float("inf"))
+
+        m_ij = tl.max(logits, axis=0)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+
+        p = tl.exp(logits - m_new)
+        p = tl.where(t_mask, p, 0.0)
+
+        v_ptrs = v_cache_ptr + physical_block_idxs[:, None, None] * stride_vb + v_block_offsets
+        v_bf16 = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+        v_bf16 = tl.reshape(v_bf16, BLOCK_N, BLOCK_D)
+
+        p_bf16 = p.to(tl.bfloat16)
+        pv = tl.sum(p_bf16[:, None] * v_bf16, axis=0, dtype=tl.float32)
+
+        m_i = m_new
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + pv
+
+    partial_m_ptrs = partial_m_ptr + chunk_idx * stride_pmc + group_idx * stride_pmg
+    partial_l_ptrs = partial_l_ptr + chunk_idx * stride_plc + group_idx * stride_plg
+    partial_acc_ptrs = partial_acc_ptr + chunk_idx * stride_pac + group_idx * stride_pag + d_offs * stride_pad
+
+    tl.store(partial_m_ptrs, m_i)
+    tl.store(partial_l_ptrs, l_i)
+    tl.store(partial_acc_ptrs, acc)
+
+
+@triton.jit
+def _paged_attention_decode_reduce_kernel(
+    chunk_offsets_ptr,
+    partial_m_ptr,
+    partial_l_ptr,
+    partial_acc_ptr,
+    out_ptr,
+    num_kv_groups,
+    stride_pmc,
+    stride_pmg,
+    stride_plc,
+    stride_plg,
+    stride_pac,
+    stride_pag,
+    stride_pad,
+    stride_oh,
+    stride_od,
+    BLOCK_D: tl.constexpr,
+):
+    kv_head_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+
+    d_offs = tl.arange(0, BLOCK_D)
+
+    start_chunk = tl.load(chunk_offsets_ptr + kv_head_idx)
+    end_chunk = tl.load(chunk_offsets_ptr + kv_head_idx + 1)
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for chunk_idx in tl.range(start_chunk, end_chunk):
+        partial_m = tl.load(partial_m_ptr + chunk_idx * stride_pmc + group_idx * stride_pmg)
+        partial_l = tl.load(partial_l_ptr + chunk_idx * stride_plc + group_idx * stride_plg)
+        partial_acc_ptrs = partial_acc_ptr + chunk_idx * stride_pac + group_idx * stride_pag + d_offs * stride_pad
+        partial_acc = tl.load(partial_acc_ptrs)
+
+        has_acc = l_i > 0
+        has_partial = partial_l > 0
+        has_both = has_acc & has_partial
+
+        m_new = tl.maximum(m_i, partial_m)
+        alpha = tl.where(has_both, tl.exp(m_i - m_new), tl.where(has_acc, 1.0, 0.0))
+        beta = tl.where(has_both, tl.exp(partial_m - m_new), tl.where(has_partial, 1.0, 0.0))
+
+        m_i = m_new
+        l_i = l_i * alpha + partial_l * beta
+        acc = acc * alpha + partial_acc * beta
+
+    q_head_idx = kv_head_idx * num_kv_groups + group_idx
+    out_ptrs = out_ptr + q_head_idx * stride_oh + d_offs * stride_od
+
+    denom = tl.where(l_i > 0, l_i, 1.0)
+    out = acc / denom
+    tl.store(out_ptrs, out)
+
+
+def _ceil_div(numer, denom):
+    return (numer + denom - 1) // denom
+
+
+def flash_attn_with_kvcache_wrapper_triton_handle(
+    q,
+    k_cache,
+    v_cache,
+    cache_seqlens,
+    block_table,
+    softmax_scale,
+    num_splits=8,
+    block_n=128,
+    num_warps=4,
+    num_stages=1,
+):
+    num_query_heads, num_kv_heads, num_kv_groups, head_size = _validate_decode_inputs(q, cache_seqlens, block_table)
+
+    if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
+        raise TypeError("This kernel only supports BF16 inputs for q, k_cache, and v_cache.")
+
+    q_heads = q[0, 0].contiguous()
+    cache_seqlens_heads = cache_seqlens[0].contiguous()
+    block_table_heads = block_table[0].contiguous()
+    out = torch.empty_like(q_heads)
+
+    block_t = k_cache.shape[1]
+    block_d = head_size
+
+    num_blocks_per_head = _ceil_div(cache_seqlens_heads, block_t).cpu().tolist()
+    total_blocks = sum(num_blocks_per_head)
+    target_chunk_count = num_kv_heads * num_splits
+    blocks_per_chunk = _ceil_div(total_blocks, target_chunk_count)
+
+    chunk_offsets = [0]
+    chunk_kv_heads = []
+    chunk_start_blocks = []
+    chunk_num_blocks = []
+
+    for kv_head_idx, num_blocks in enumerate(num_blocks_per_head):
+        num_chunks = _ceil_div(num_blocks, blocks_per_chunk)
+        for chunk_idx in range(num_chunks):
+            start_block = chunk_idx * blocks_per_chunk
+            live_blocks = min(blocks_per_chunk, num_blocks - start_block)
+            chunk_kv_heads.append(kv_head_idx)
+            chunk_start_blocks.append(start_block)
+            chunk_num_blocks.append(live_blocks)
+        chunk_offsets.append(len(chunk_kv_heads))
+
+    chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int32, device=q.device)
+    chunk_kv_heads = torch.tensor(chunk_kv_heads, dtype=torch.int32, device=q.device)
+    chunk_start_blocks = torch.tensor(chunk_start_blocks, dtype=torch.int32, device=q.device)
+    chunk_num_blocks = torch.tensor(chunk_num_blocks, dtype=torch.int32, device=q.device)
+
+    total_live_chunks = chunk_kv_heads.numel()
+    partial_m = torch.empty(
+        (total_live_chunks, num_kv_groups),
+        dtype=torch.float32, device=q.device
+    )
+    partial_l = torch.empty(
+        (total_live_chunks, num_kv_groups),
+        dtype=torch.float32, device=q.device
+    )
+    partial_acc = torch.empty(
+        (total_live_chunks, num_kv_groups, head_size),
+        dtype=torch.float32, device=q.device
+    )
+
+    def handle():
+        split_grid = (total_live_chunks, num_kv_groups)
+        _paged_attention_decode_split_kernel[split_grid](
+            q_heads,
+            k_cache,
+            v_cache,
+            cache_seqlens_heads,
+            block_table_heads,
+            chunk_kv_heads,
+            chunk_start_blocks,
+            chunk_num_blocks,
+            softmax_scale,
+            partial_m,
+            partial_l,
+            partial_acc,
+            num_kv_groups,
+            q_heads.stride(0),
+            q_heads.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            cache_seqlens_heads.stride(0),
+            block_table_heads.stride(0),
+            block_table_heads.stride(1),
+            partial_m.stride(0),
+            partial_m.stride(1),
+            partial_l.stride(0),
+            partial_l.stride(1),
+            partial_acc.stride(0),
+            partial_acc.stride(1),
+            partial_acc.stride(2),
+            BLOCK_N=block_n,
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        reduce_grid = (num_kv_heads, num_kv_groups)
+        _paged_attention_decode_reduce_kernel[reduce_grid](
+            chunk_offsets,
+            partial_m,
+            partial_l,
+            partial_acc,
+            out,
+            num_kv_groups,
+            partial_m.stride(0),
+            partial_m.stride(1),
+            partial_l.stride(0),
+            partial_l.stride(1),
+            partial_acc.stride(0),
+            partial_acc.stride(1),
+            partial_acc.stride(2),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        return out.view(1, 1, num_query_heads, head_size)
+    
+    return handle
+
+
+def flash_attn_with_kvcache_wrapper_triton(*args, **kwargs):
+    return flash_attn_with_kvcache_wrapper_triton_handle(*args, **kwargs)()
+
+
+def get_layer_local_kv_views(self, past_key_value):
+    layer_local_start = self.layer_idx * self.config.num_key_value_heads * self.config.local_window_size
+    layer_local_span = self.config.num_key_value_heads * self.config.local_window_size
+    layer_local_slice = slice(layer_local_start, layer_local_start + layer_local_span)
+
+    local_block_pool_k = past_key_value.block_pool_k[layer_local_slice].view(
+        self.config.num_key_value_heads, self.config.local_window_size, self.head_dim
+    )
+    local_block_pool_v = past_key_value.block_pool_v[layer_local_slice].view(
+        self.config.num_key_value_heads, self.config.local_window_size, self.head_dim
+    )
+    assert local_block_pool_k.untyped_storage().data_ptr() == past_key_value.block_pool_k.untyped_storage().data_ptr()
+    assert local_block_pool_v.untyped_storage().data_ptr() == past_key_value.block_pool_v.untyped_storage().data_ptr()
+
+    return local_block_pool_k, local_block_pool_v
+
+
+def get_random_g_scores(self, batch_size, kv_seq_len, device):
+    random_mask = torch.rand(
+        batch_size, self.config.num_key_value_heads, kv_seq_len,
+        dtype=torch.bfloat16, device=device
+    )
+    g_scores = (random_mask >= self.config.random_sparsity).to(torch.bfloat16)
+    return g_scores
+
+
+def refresh_local_is_global(self, past_key_value, device):
+    if self.config.g_expand != 0.0:
+        local_block_pool_k, local_block_pool_v = get_layer_local_kv_views(self, past_key_value)
+        g_scores = self.g_predictors(
+            past_key_value.local_pre_key[self.layer_idx].unsqueeze(0),
+            local_block_pool_k.unsqueeze(0),
+            local_block_pool_v.unsqueeze(0),
+        )
+    if self.config.random_sparsity is not None:
+        g_scores = get_random_g_scores(self, 1, self.config.local_window_size, device)
+
+    past_key_value.local_is_global[self.layer_idx] = g_scores[0] > self.config.g_threshold
+
+
 def prefill_wrapper(
     self,
     past_key_value,
     query_states,
+    pre_key,
     key_states,
     value_states,
     batch_size,
@@ -866,6 +1239,12 @@ def prefill_wrapper(
                 dtype=key_states.dtype, device=device
             )
 
+        if self.config.g_defer:
+            past_key_value.local_pre_key = torch.empty(
+                self.config.num_hidden_layers, self.config.num_key_value_heads, self.config.local_window_size, self.head_dim,
+                dtype=key_states.dtype, device=device
+            )
+
         # These variables stay on CPU and GPU (only if SnapKV is used)
         if self.config.snapkv_enabled:
             assert not self.config.use_quest
@@ -910,24 +1289,15 @@ def prefill_wrapper(
 
     # Prefilling
     # 1. Write local cache
-    layer_local_start = self.layer_idx * self.config.num_key_value_heads * self.config.local_window_size
-    layer_local_span = self.config.num_key_value_heads * self.config.local_window_size
-    layer_local_slice = slice(layer_local_start, layer_local_start + layer_local_span)
-
-    local_block_pool_k = past_key_value.block_pool_k[layer_local_slice].view(
-        self.config.num_key_value_heads, self.config.local_window_size, self.head_dim
-    )
-    local_block_pool_v = past_key_value.block_pool_v[layer_local_slice].view(
-        self.config.num_key_value_heads, self.config.local_window_size, self.head_dim
-    )
-    assert local_block_pool_k.untyped_storage().data_ptr() == past_key_value.block_pool_k.untyped_storage().data_ptr()
-    assert local_block_pool_v.untyped_storage().data_ptr() == past_key_value.block_pool_v.untyped_storage().data_ptr()
-
+    local_block_pool_k, local_block_pool_v = get_layer_local_kv_views(self, past_key_value)
     num_local_tokens = min(q_seq_len, self.config.local_window_size)
     local_block_pool_k[:, :num_local_tokens] = key_states[0, :, -num_local_tokens:]
     local_block_pool_v[:, :num_local_tokens] = value_states[0, :, -num_local_tokens:]
     past_key_value.local_is_global[self.layer_idx, :, :num_local_tokens] = g_mask[0, :, -num_local_tokens:]
     past_key_value.local_length = num_local_tokens
+
+    if self.config.g_defer:
+        past_key_value.local_pre_key[self.layer_idx, :, :num_local_tokens] = pre_key[0, :, -num_local_tokens:]
 
     # 2. Write global cache
     for h in range(self.config.num_key_value_heads):
@@ -1010,6 +1380,7 @@ def decode_wrapper(
     self,
     past_key_value,
     query_states,
+    pre_key,
     key_states,
     value_states,
     device,
@@ -1027,7 +1398,13 @@ def decode_wrapper(
     local_linear_indices = local_region_starts + insert_pos
     past_key_value.block_pool_k[local_linear_indices] = key_states[0, :, 0]
     past_key_value.block_pool_v[local_linear_indices] = value_states[0, :, 0]
-    past_key_value.local_is_global[self.layer_idx, :, insert_pos] = g_mask[0, :, 0]
+
+    if g_mask is None:
+        past_key_value.local_pre_key[self.layer_idx, :, insert_pos] = pre_key[0, :, 0]
+        if insert_pos == self.config.local_window_size - 1:
+            refresh_local_is_global(self, past_key_value, device)
+    else:
+        past_key_value.local_is_global[self.layer_idx, :, insert_pos] = g_mask[0, :, 0]
 
     if self.layer_idx == self.config.num_hidden_layers - 1:
         if past_key_value.local_length < self.config.local_window_size:
@@ -1059,7 +1436,7 @@ def decode_wrapper(
         )
 
     query_states = query_states.transpose(1, 2)  # (batch_size=1, q_seqlen=1, num_heads, head_dim)
-    attn_output = self.decode_kernel(
+    handle = self.decode_kernel_handle(
         query_states,
         k_cache,                       # (total_blocks, block_size, head_dim)
         v_cache,                       # (total_blocks, block_size, head_dim)
@@ -1067,6 +1444,7 @@ def decode_wrapper(
         block_table,                   # (batch_size=1, num_kv_heads, max_blocks_per_head)
         self.scaling,
     )
+    attn_output = self.decode_kernel_executor(handle)
 
     return attn_output
 
@@ -1076,6 +1454,7 @@ def self_attn_forward_patch_inference(
     past_key_value,
     input_shape,
     query_states,
+    pre_key,
     key_states,
     value_states,
     g_scores,
@@ -1083,7 +1462,7 @@ def self_attn_forward_patch_inference(
     batch_size, q_seq_len = input_shape
     device = query_states.device
     is_prefilling = q_seq_len > 1
-    g_mask = g_scores > self.config.g_threshold
+    g_mask = (g_scores > self.config.g_threshold) if g_scores is not None else None
 
     assert self.config.local_window_size % self.config.block_size == 0
     local_blocks_per_head = self.config.local_window_size // self.config.block_size
@@ -1096,6 +1475,7 @@ def self_attn_forward_patch_inference(
             self,
             past_key_value,
             query_states,
+            pre_key,
             key_states,
             value_states,
             batch_size,
@@ -1109,6 +1489,7 @@ def self_attn_forward_patch_inference(
             self,
             past_key_value,
             query_states,
+            pre_key,
             key_states,
             value_states,
             device,
@@ -1126,6 +1507,28 @@ def self_attn_forward_patch_inference(
             snapkv_evict(self, past_key_value, device, local_blocks_per_head)
 
     return attn_output
+
+
+def create_adaea_g_scores(
+    self,
+    key_states,
+):
+    bsz, num_key_value_heads, k_len, d = key_states.shape
+
+    mean_query = self.adaea_mean_query.unsqueeze(0).unsqueeze(2)
+    cov_query = self.adaea_cov_query.unsqueeze(0)
+
+    expanded_keys = key_states.repeat_interleave(self.num_key_value_groups, dim=1).transpose(2, 3)
+    scores = torch.matmul(mean_query, expanded_keys).squeeze(2) / math.sqrt(d)
+    scores += torch.einsum("bhin, bhij, bhjn->bhn", expanded_keys, cov_query, expanded_keys) / d / 2
+
+    scores = scores.view(bsz, num_key_value_heads, self.num_key_value_groups, k_len)
+    scores[:, :, :, :self.config.adaea_sink_size] = float("inf")
+
+    threshold = self.adaea_threshold.reshape(num_key_value_heads, self.num_key_value_groups)[None, :, :, None]
+    mask = (scores <= threshold).all(dim=2)
+
+    return (~mask).to(torch.bfloat16)
 
 
 def self_attn_forward_patch(
@@ -1166,16 +1569,16 @@ def self_attn_forward_patch(
                 num_kv_heads=self.config.num_key_value_heads,
             )
             g_scores = torch.where(sink_mask, 1.0, g_scores)
+    elif self.config.use_adaea:
+        g_scores = create_adaea_g_scores(self, key_states)
     else:
-        if self.config.g_expand != 0.0:
-            g_scores = self.g_predictors(pre_key, key_states, value_states) # shape: (batch_size, num_key_value_heads, kv_seq_len)
-
-        if self.config.random_sparsity is not None:
-            random_mask = torch.rand(
-                batch_size, self.config.num_key_value_heads, kv_seq_len,
-                dtype=torch.bfloat16, device=device
-            )
-            g_scores = (random_mask >= self.config.random_sparsity).to(torch.bfloat16)
+        if kv_seq_len == 1 and self.config.g_defer:
+            g_scores = None
+        else:
+            if self.config.g_expand != 0.0:
+                g_scores = self.g_predictors(pre_key, key_states, value_states) # shape: (batch_size, num_key_value_heads, kv_seq_len)
+            if self.config.random_sparsity is not None:
+                g_scores = get_random_g_scores(self, batch_size, kv_seq_len, device)
     
     if getattr(self, "use_hard_threshold", False):
         g_scores_dtype = g_scores.dtype
@@ -1216,6 +1619,7 @@ def self_attn_forward_patch(
             past_key_value,
             input_shape,
             query_states,
+            pre_key,
             key_states,
             value_states,
             g_scores,
@@ -1236,3 +1640,15 @@ def set_duo_attn_alpha(model, attn_heads):
             else:
                 assert False
             model.model.layers[layer_idx].self_attn.duo_attn_alpha.data[head_idx] = duo_attn_alpha
+
+
+def set_adaea_data(model, threshold_path, query_stats_path):
+    threshold_np = np.loadtxt(threshold_path, delimiter='\t')
+    threshold = torch.from_numpy(threshold_np)
+    for layer_idx in range(model.config.num_hidden_layers):
+        model.model.layers[layer_idx].self_attn.adaea_threshold.data.copy_(threshold[layer_idx])
+
+    query_stats = torch.load(query_stats_path, weights_only=False)
+    for layer_idx in range(model.config.num_hidden_layers):
+        model.model.layers[layer_idx].self_attn.adaea_mean_query.data.copy_(query_stats['mean_query'][layer_idx])
+        model.model.layers[layer_idx].self_attn.adaea_cov_query.data.copy_(query_stats['cov_query'][layer_idx])

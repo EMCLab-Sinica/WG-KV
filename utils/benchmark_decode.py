@@ -9,7 +9,7 @@ from benchmark_utils import (
     format_run_description,
     format_iteration_summary,
 )
-from transformers.modeling_layers import flash_attn_with_kvcache_wrapper
+from transformers.modeling_layers import flash_attn_with_kvcache_wrapper_triton
 
 
 @dataclass
@@ -31,6 +31,8 @@ def parse_args():
     )
     parser.add_argument("--block_size", type=int, default=16)
     parser.add_argument("--no_randomize_block_table", action="store_true")
+    parser.add_argument("--dense_sparsity", type=float, default=0.1)
+    parser.add_argument("--sparse_sparsity", type=float, default=0.9)
     return parser.parse_args()
 
 
@@ -43,6 +45,8 @@ def prepare_inputs(
     head_dim: int,
     block_size: int,
     no_randomize_block_table: bool,
+    dense_sparsity: float,
+    sparse_sparsity: float,
 ):
     max_num_blocks_per_head = (seq_len + block_size - 1) // block_size
     total_blocks = batch_size * num_kv_heads * max_num_blocks_per_head
@@ -57,11 +61,13 @@ def prepare_inputs(
     )
     v_cache = torch.randn_like(k_cache)
 
-    cache_seqlens = torch.full(
-        (batch_size, num_kv_heads),
-        seq_len,
-        dtype=torch.int32,
-    )
+    len_dense = max(1, int(seq_len * (1.0 - dense_sparsity)))
+    len_sparse = max(1, int(seq_len * (1.0 - sparse_sparsity)))
+
+    cache_seqlens = torch.empty((batch_size, num_kv_heads), dtype=torch.int32)
+    
+    cache_seqlens[:, 0::2] = len_dense
+    cache_seqlens[:, 1::2] = len_sparse
 
     if no_randomize_block_table:
         block_ids = torch.arange(total_blocks, dtype=torch.int32)
@@ -88,7 +94,7 @@ def benchmark_kernel(
     measure_iters: int,
 ) -> float:
     def forward():
-        flash_attn_with_kvcache_wrapper(
+        flash_attn_with_kvcache_wrapper_triton(
             inputs.q,
             inputs.k_cache,
             inputs.v_cache,
@@ -112,10 +118,14 @@ def main():
 
     print(
         format_run_description(
-            "flash_attn_with_kvcache_wrapper",
+            "flash_attn_with_kvcache_wrapper_triton",
             device=device,
             args=args,
-            extra_fields=(("block", args.block_size),),
+            extra_fields=(
+                ("block", args.block_size),
+                ("dense_sparsity", f"{args.dense_sparsity:.3f}"),
+                ("sparse_sparsity", f"{args.sparse_sparsity:.3f}"),
+            ),
         )
     )
     print(
@@ -135,6 +145,8 @@ def main():
             head_dim=args.head_dim,
             block_size=args.block_size,
             no_randomize_block_table=args.no_randomize_block_table,
+            dense_sparsity=args.dense_sparsity,
+            sparse_sparsity=args.sparse_sparsity,
         )
 
         avg_ms = benchmark_kernel(

@@ -30,7 +30,8 @@ def parse_args():
         measure_default=10,
     )
     parser.add_argument("--local_window_size", type=int, default=256)
-    parser.add_argument("--sparsity", type=float, default=0.5)
+    parser.add_argument("--dense_sparsity", type=float, default=0.1)
+    parser.add_argument("--sparse_sparsity", type=float, default=0.9)
     return parser.parse_args()
 
 
@@ -41,7 +42,8 @@ def prepare_inputs(
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    sparsity: float,
+    dense_sparsity: float,
+    sparse_sparsity: float,
 ) -> BenchmarkInputs:
     q = torch.randn(
         batch_size, seq_len, num_query_heads, head_dim,
@@ -53,7 +55,14 @@ def prepare_inputs(
     )
     v = torch.randn_like(k)
 
-    g_mask = (torch.rand(batch_size, num_kv_heads, seq_len) >= sparsity).to(torch.bool)
+    g_mask = torch.empty((batch_size, num_kv_heads, seq_len), dtype=torch.bool)
+
+    num_even_heads = (num_kv_heads + 1) // 2
+    num_odd_heads = num_kv_heads // 2
+
+    g_mask[:, 0::2, :] = torch.rand(batch_size, num_even_heads, seq_len) >= dense_sparsity
+    g_mask[:, 1::2, :] = torch.rand(batch_size, num_odd_heads, seq_len) >= sparse_sparsity
+
     softmax_scale = head_dim ** -0.5
 
     return BenchmarkInputs(
@@ -162,7 +171,8 @@ def main():
             args=args,
             extra_fields=(
                 ("local_window", args.local_window_size),
-                ("sparsity", f"{args.sparsity:.3f}"),
+                ("dense_sparsity", f"{args.dense_sparsity:.3f}"),
+                ("sparse_sparsity", f"{args.sparse_sparsity:.3f}"),
             ),
         )
     )
@@ -183,7 +193,8 @@ def main():
             num_query_heads=args.num_query_heads,
             num_kv_heads=args.num_kv_heads,
             head_dim=args.head_dim,
-            sparsity=args.sparsity,
+            dense_sparsity=args.dense_sparsity,
+            sparse_sparsity=args.sparse_sparsity,
         )
 
         gen_ms, (block_count, block_offset, column_count, column_index) = measure_sparse_index_generation(

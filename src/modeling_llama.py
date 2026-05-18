@@ -37,7 +37,8 @@ from ...modeling_layers import (
     prefill_wrapper,
     decode_wrapper,
     sparse_attn_func_wrapper,
-    flash_attn_with_kvcache_wrapper,
+    flash_attn_with_kvcache_wrapper_handle,
+    flash_attn_with_kvcache_wrapper_triton_handle,
 )
 from ...modeling_outputs import (
     BaseModelOutputWithPast,
@@ -229,6 +230,10 @@ class LlamaAttention(nn.Module):
             pass
         elif config.use_duo_attn:
             self.duo_attn_alpha = nn.Parameter(torch.empty(config.num_key_value_heads))
+        elif config.use_adaea:
+            self.adaea_threshold = nn.Parameter(torch.empty(config.num_attention_heads))
+            self.adaea_mean_query = nn.Parameter(torch.empty(config.num_attention_heads, self.head_dim))
+            self.adaea_cov_query = nn.Parameter(torch.empty(config.num_attention_heads, self.head_dim, self.head_dim))
         elif config.g_expand != 0.0:
             self.g_predictors = GatingPredictor(self.head_dim, config.num_key_value_heads, config.g_inputs, config.g_act_fn, config.g_expand, config.g_epsilon, config.g_rms, config.g_fast_path)
 
@@ -236,7 +241,13 @@ class LlamaAttention(nn.Module):
         self.prefill_wrapper = prefill_wrapper
         self.decode_wrapper = decode_wrapper
         self.prefill_kernel = sparse_attn_func_wrapper
-        self.decode_kernel = flash_attn_with_kvcache_wrapper
+
+        if config.use_triton_kernel:
+            self.decode_kernel_handle = flash_attn_with_kvcache_wrapper_triton_handle
+        else:
+            self.decode_kernel_handle = flash_attn_with_kvcache_wrapper_handle
+
+        self.decode_kernel_executor = lambda func: func()
 
     def forward(
         self,

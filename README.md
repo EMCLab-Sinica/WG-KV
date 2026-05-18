@@ -1,23 +1,23 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2512.17452-b31b1b.svg)](https://arxiv.org/abs/2512.17452)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-This repository contains the official implementation of the paper **"KV Admission: Learning What to Write for Efficient Long-Context Inference"**.
+This repository contains the official implementation of the paper **"KV Admission: Learning What to Write for Efficient Long-Context LLM Inference"**.
 
-## 📖 Abstract
+## 📖 Introduction
 
-Long-context LLM inference is bottlenecked by the quadratic attention complexity and linear KV cache growth. Prior approaches (KV Selection or Eviction) mitigate this post-hoc, but overlook the root inefficiency: indiscriminate writing to memory.
+Long-context LLM inference is bottlenecked by the quadratic attention complexity and linear KV cache growth. Prior approaches (KV Selection or Eviction) mitigate this post-hoc, but overlook the root inefficiency: indiscriminate token admission.
 
-We propose **Write-Gated KV (WG-KV)** to introduce a missing primitive: **KV Admission**. Instead of blindly persisting every token, WG-KV employs a lightweight, learnable mechanism to predict token utility before cache entry. By filtering out low-utility states early to maintain a compact global cache alongside a sliding local cache, WG-KV reduces memory usage by **46-68%** and delivers **3.03-3.70x** prefill and **1.85-2.56x** decode speedups. Furthermore, WG-KV seamlessly composes with existing KV Selection and Eviction methods, unlocking compound efficiency gains without significant architectural changes.
+We propose **Write-Gated KV (WG-KV)** to introduce the missing primitive: **KV Admission**. Instead of blindly accumulating every token, WG-KV employs a lightweight, learnable mechanism to predict token utility before cache entry. By filtering out redundant states early to maintain a compact global cache alongside a sliding local cache, WG-KV reduces memory usage by **36-69%** and delivers **2.56-4.17x** prefill and **1.59-2.63x** decode speedups, all while maintaining near-lossless task accuracy.
 
-<p align="center" width="100%"><img src="assets/fig5.png" width="400"></p>
+<p align="center" width="100%"><img src="assets/fig1_5.png" width="1200"></p>
 
 ## ⚙️ System Architecture
 
-Implementing WG-KV results in **Ragged KV States**, where different attention heads possess significantly different cache lengths. Standard contiguous memory allocation would lead to severe fragmentation. To solve this, we introduce **Dual-Cache Paged Memory Management**:
+Implementing WG-KV results in **ragged KV states**, where different attention heads possess significantly different cache lengths. Standard contiguous memory allocation would lead to severe fragmentation. To solve this, we introduce **dual-cache paged memory management**:
 
 <p align="center" width="100%"><img src="assets/fig6.png" width="800"></p>
 
-This design ensures that WG-KV remains compatible with optimized **PagedAttention** kernels, translating theoretical sparsity into actual wall-clock speedups.
+This design effectively manages ragged KV states without memory fragmentation, while translating theoretical sparsity into practical wall-clock speedups.
 
 ## 🛠️ Installation
 
@@ -69,8 +69,8 @@ MAX_JOBS=4 uv pip install --no-build-isolation -e scripts/third_party/vllm
 
 We provide pre-trained weights for the **Write-Gate MLP**. The checkpoints follow the naming convention `{model_name}-{lambda}.pt`, where `lambda` (λ) controls the trade-off between sparsity and accuracy:
 
-* **Higher λ:** Higher sparsity, retaining less KV cache (Aggressive).
-* **Lower λ:** Higher accuracy, retaining more KV cache (Conservative).
+* **Higher λ:** Higher sparsity, admitting less KV (Aggressive).
+* **Lower λ:** Higher accuracy, admitting more KV (Conservative).
 
 You can download them directly from [🤗 our Hugging Face Repository](https://huggingface.co/WG-KV/checkpoints).
 
@@ -120,37 +120,42 @@ python scripts/inference.py \
 
 ### 1. System Efficiency ⚡
 
-WG-KV significantly accelerates inference while reducing resource consumption. On Llama-3.1-8B with 75% sparsity, it achieves **~3x prefill speedup**, **~2x decode speedup**, and a **~50% reduction in memory usage**.
+WG-KV significantly accelerates inference while reducing resource consumption. On Llama-3.1-8B with λ = 0.16 (~80% sparsity by admitting ~20% KVs), it achieves **~3x prefill speedup**, **~2x decode speedup**, and a **~50% reduction in memory usage**.
 
 <details>
 
 <summary>Show commands</summary>
 
 ```bash
-# Baseline (Full Attention)
+# Evaluate Baseline (Full Attention)
 python scripts/profiling.py \
   --model_name meta-llama/Llama-3.1-8B-Instruct \
   --profile_attn_mlp \
+  --use_pg19 \
+  --avg_tokens_per_head 401000 \
   --max_tokens_per_head 401000 \
   --prompt_length 400000 \
-  --g_expand 0
+  --g_expand 0 \
+  --random_sparsity 0.0
 
-# WG-KV (75% Sparsity)
+# Evaluate WG-KV
 python scripts/profiling.py \
   --model_name meta-llama/Llama-3.1-8B-Instruct \
   --profile_attn_mlp \
+  --use_pg19 \
+  --avg_tokens_per_head 121000 \
   --max_tokens_per_head 401000 \
   --prompt_length 400000 \
-  --random_sparsity 0.75
+  --filtering_path weights/llama-3.1-8b-instruct-0.16.pt
 ```
 
 </details>
 
 <p align="center" width="100%"><img src="assets/fig8.png" width="400"></p>
 
-### 2. Long-Context Understanding (HELMET) 🧠
+### 2. Task Accuracy 🧠
 
-Evaluated on the [HELMET](https://github.com/princeton-nlp/HELMET) benchmark, WG-KV outperforms static admission baselines (e.g., Local Attention, DuoAttention) across diverse tasks, maintaining **near-lossless accuracy** even with **<10% KV cache**.
+Evaluated on the [HELMET](https://github.com/princeton-nlp/HELMET) benchmark, WG-KV significantly outperforms admission baselines (AdaEA++, DuoAttention, Local Attention) across diverse tasks, maintaining **near-lossless accuracy** even with **<10% admitted KVs**.
 
 <details>
 
@@ -169,11 +174,13 @@ env -C scripts/third_party/HELMET bash scripts/download_data.sh
 
 # Link checkpoints directory
 ln -s ../../../weights scripts/third_party/HELMET/weights
+ln -s ../../../utils/gather_adaea_stats/patterns scripts/third_party/HELMET/weights/adaea
 
-# Evaluate Baselines (Full Attention, Local Attention, DuoAttention)
+# Evaluate Baselines (Full Attention, Local Attention, DuoAttention, AdaEA++)
 env -C scripts/third_party/HELMET bash run_vanilla_all.sh
 env -C scripts/third_party/HELMET bash run_local_all.sh
 env -C scripts/third_party/HELMET bash run_duo_all.sh
+env -C scripts/third_party/HELMET bash run_adaea_all.sh
 
 # Evaluate WG-KV
 env -C scripts/third_party/HELMET bash run_filtering_all.sh
@@ -182,62 +189,6 @@ env -C scripts/third_party/HELMET bash run_filtering_all.sh
 </details>
 
 <p align="center" width="100%"><img src="assets/fig7.png" width="800"></p>
-
-Furthermore, WG-KV is **composable** with **Quest (KV Selection)**, enabling compound efficiency gains by filtering noise before selection occurs.
-
-<details>
-
-<summary>Show commands</summary>
-
-```bash
-# Evaluate "Quest Only"
-env -C scripts/third_party/HELMET bash run_quest_all.sh "320 512 1024 2048 4096 8192"
-
-# Evaluate "WG-KV + Quest"
-env -C scripts/third_party/HELMET bash run_fquest_all.sh "0.08" "320 512 1024 2048 4096 8192"
-```
-
-</details>
-
-<p align="center" width="100%"><img src="assets/fig9.png" width="800"></p>
-
-### 3. Complex Reasoning (AIME25) 🧩
-
-WG-KV also excels in reasoning tasks where long thinking traces rapidly consume memory. Under strict memory bounds, relying solely on **SnapKV (KV Eviction)** leads to **catastrophic degradation (26.7% accuracy)**. By pairing it with **WG-KV (KV Admission)** to filter noise early, we **restore accuracy to 80.0%**, matching the unbounded baseline.
-
-<details>
-
-<summary>Show commands</summary>
-
-```bash
-# Install lm-evaluation-harness
-uv pip install -e scripts/third_party/lm-evaluation-harness
-
-# Evaluate Unbounded KV Cache Baseline
-python scripts/eval.py \
-  --model_name Qwen/Qwen3-4B-Thinking-2507 \
-  --use_baseline
-
-# Evaluate "SnapKV Only"
-python scripts/eval.py \
-  --model_name Qwen/Qwen3-4B-Thinking-2507 \
-  --snapkv_enabled \
-  --snapkv_max_cached_tokens 1105920 \
-  --snapkv_evict_ratio 0.1 \
-  --use_baseline
-
-# Evaluate "WG-KV + SnapKV"
-python scripts/eval.py \
-  --model_name Qwen/Qwen3-4B-Thinking-2507 \
-  --snapkv_enabled \
-  --snapkv_max_cached_tokens 1105920 \
-  --snapkv_evict_ratio 0.1 \
-  --filtering_path weights/qwen3-4b-thinking-2507-0.32.pt
-```
-
-</details>
-
-<p align="center" width="100%"><img src="assets/fig10.png" width="400"></p>
 
 ## 📂 Repository Structure
 

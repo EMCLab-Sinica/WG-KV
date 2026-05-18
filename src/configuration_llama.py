@@ -194,6 +194,8 @@ class LlamaConfig(PretrainedConfig):
         g_ungate_count=0,
         use_duo_attn=False,
         duo_attn_sink_size=128,
+        use_adaea=False,
+        adaea_sink_size=4,
         use_baseline=False,
         block_size=16,
         max_total_tokens=None,
@@ -203,11 +205,13 @@ class LlamaConfig(PretrainedConfig):
         dump_tensors=False,
         random_sparsity=None,
         g_fast_path=False,
+        g_defer=False,
         snapkv_enabled=False,
         snapkv_max_cached_tokens=-1,
         snapkv_evict_ratio=0.0,
         snapkv_window_size=256,
         snapkv_kernel_size=5,
+        use_triton_kernel=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -245,6 +249,8 @@ class LlamaConfig(PretrainedConfig):
         self.g_ungate_count = g_ungate_count
         self.use_duo_attn = use_duo_attn
         self.duo_attn_sink_size = duo_attn_sink_size
+        self.use_adaea = use_adaea
+        self.adaea_sink_size = adaea_sink_size
         self.use_baseline = use_baseline
         self.block_size = block_size
         self.max_total_tokens = max_total_tokens
@@ -254,11 +260,13 @@ class LlamaConfig(PretrainedConfig):
         self.dump_tensors = dump_tensors
         self.random_sparsity = random_sparsity
         self.g_fast_path = g_fast_path
+        self.g_defer = g_defer
         self.snapkv_enabled = snapkv_enabled
         self.snapkv_max_cached_tokens = snapkv_max_cached_tokens
         self.snapkv_evict_ratio = snapkv_evict_ratio
         self.snapkv_window_size = snapkv_window_size
         self.snapkv_kernel_size = snapkv_kernel_size
+        self.use_triton_kernel = use_triton_kernel
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, copy it it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:

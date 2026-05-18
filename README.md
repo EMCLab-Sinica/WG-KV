@@ -69,8 +69,8 @@ MAX_JOBS=4 uv pip install --no-build-isolation -e scripts/third_party/vllm
 
 We provide pre-trained weights for the **Write-Gate MLP**. The checkpoints follow the naming convention `{model_name}-{lambda}.pt`, where `lambda` (λ) controls the trade-off between sparsity and accuracy:
 
-* **Higher λ:** Higher sparsity, admitting less KV (Aggressive).
-* **Lower λ:** Higher accuracy, admitting more KV (Conservative).
+* **Higher λ (Aggressive):** Higher sparsity, admitting fewer KVs (prioritizes efficiency).
+* **Lower λ (Conservative):** Lower sparsity, admitting more KVs (prioritizes accuracy).
 
 You can download them directly from [🤗 our Hugging Face Repository](https://huggingface.co/WG-KV/checkpoints).
 

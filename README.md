@@ -117,7 +117,7 @@ python scripts/inference.py \
 
 ### 1. System Efficiency ⚡
 
-WG-KV significantly accelerates inference while reducing resource consumption. On Llama-3.1-8B with λ = 0.16 (~80% sparsity by admitting ~20% KVs), it achieves **~3x prefill speedup**, **~2x decode speedup**, and a **~50% reduction in memory usage**.
+WG-KV significantly accelerates inference while reducing resource consumption. On Llama-3.1-8B with λ = 0.16 (\~80% sparsity by admitting \~20% KVs), it achieves **\~3x prefill speedup**, **\~2x decode speedup**, and a **\~50% reduction in memory usage**.
 
 <details>
 

@@ -67,7 +67,7 @@ MAX_JOBS=4 uv pip install --no-build-isolation -e scripts/third_party/vllm
 
 ## 📦 Model Checkpoints
 
-We provide pre-trained weights for the **Write-Gate MLP**. The checkpoints follow the naming convention `{model_name}-{lambda}.pt`, where `lambda` (λ) controls the trade-off between sparsity and accuracy:
+We provide pre-trained weights for the **Write-Gate MLP**. The checkpoints follow the naming convention `{model_name}-{lambda}.pt`, where `lambda` (λ) controls the tradeoff between efficiency and accuracy:
 
 * **Higher λ (Aggressive):** Higher sparsity, admitting fewer KVs (prioritizes efficiency).
 * **Lower λ (Conservative):** Lower sparsity, admitting more KVs (prioritizes accuracy).
@@ -97,7 +97,7 @@ python scripts/train.py \
   --lambda_reg 0.16
 ```
 
-The trained checkpoints will be saved in the `outputs/` directory.
+The resulting checkpoints will be saved in the `outputs/` directory.
 
 *See `scripts/train.py` for additional arguments.*
 
@@ -152,7 +152,7 @@ python scripts/profiling.py \
 
 ### 2. Task Accuracy 🧠
 
-Evaluated on the [HELMET](https://github.com/princeton-nlp/HELMET) benchmark, WG-KV significantly outperforms admission baselines (AdaEA++, DuoAttention, Local Attention) across diverse tasks, maintaining **near-lossless accuracy** even with **<10% admitted KVs**.
+Evaluated on the [HELMET](https://github.com/princeton-nlp/HELMET) benchmark, WG-KV significantly outperforms baselines (AdaEA++, DuoAttention, Local Attention) across diverse tasks, maintaining **near-lossless accuracy** even with **<10% admitted KVs**.
 
 <details>
 

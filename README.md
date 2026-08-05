@@ -187,6 +187,10 @@ env -C scripts/third_party/HELMET bash run_filtering_all.sh
 
 <p align="center" width="100%"><img src="assets/fig7.png" width="800"></p>
 
+## 🔌 Porting to Other Models
+
+This repository ships with support for the Llama and Qwen3 families. The core logic in `src/modeling_layers.py` is architecture-agnostic, so supporting another model only requires patching its [🤗 Transformers](https://github.com/huggingface/transformers) modeling and configuration files. See [PORTING.md](PORTING.md) for a step-by-step guide.
+
 ## 📂 Repository Structure
 
 * `scripts/`: Training, inference, and evaluation scripts.

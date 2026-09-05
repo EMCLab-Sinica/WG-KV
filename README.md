@@ -203,7 +203,7 @@ If you find this work useful, please cite our paper:
 
 ```bibtex
 @misc{wgkv,
-   title={KV Admission: Learning What to Write for Efficient Long-Context Inference},
+   title={KV Admission: Learning What to Write for Efficient Long-Context LLM Inference},
    author={Yen-Chieh Huang and Pi-Cheng Hsiu and Rui Fang and Ming-Syan Chen},
    year={2025},
    eprint={2512.17452},

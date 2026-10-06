@@ -1,7 +1,14 @@
-[![arXiv](https://img.shields.io/badge/arXiv-2512.17452-b31b1b.svg)](https://arxiv.org/abs/2512.17452)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-
 This repository contains the official implementation of the paper **"KV Admission: Learning What to Write for Efficient Long-Context LLM Inference"**.
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2512.17452">
+    <img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?style=for-the-badge&amp;logo=arxiv&amp;logoColor=white" alt="Paper on arXiv">
+  </a>
+  &nbsp;
+  <a href="poster.pdf">
+    <img src="https://img.shields.io/badge/Poster-PDF-2563eb?style=for-the-badge" alt="Poster PDF">
+  </a>
+</p>
 
 ## 📖 Introduction
 
